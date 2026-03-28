@@ -9,6 +9,11 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@capacitor/android": "^8.3.0",
+    "@capacitor/cli": "^8.3.0",
+    "@capacitor/core": "^8.3.0",
+    "@capacitor/geolocation": "^8.1.0",
+    "@capacitor/local-notifications": "^8.0.2",
     "axios": "^1.13.6",
     "next": "14.2.35",
     "react": "^18",

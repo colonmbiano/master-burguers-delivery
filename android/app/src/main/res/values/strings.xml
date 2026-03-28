@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Master Burger Delivery</string>
+    <string name="title_activity_main">Master Burger Delivery</string>
+    <string name="package_name">com.masterburguers.delivery</string>
+    <string name="custom_url_scheme">com.masterburguers.delivery</string>
+</resources>

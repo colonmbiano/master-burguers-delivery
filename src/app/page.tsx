@@ -3,6 +3,7 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import api from "@/lib/api";
 import GPSTracker from "@/components/delivery/GPSTracker";
+import { LocalNotifications } from '@capacitor/local-notifications';
 
 const STATUS_LABELS: Record<string, string> = {
   PENDING:"Pendiente", CONFIRMED:"Confirmado", PREPARING:"Preparando",
@@ -18,10 +19,10 @@ const EXPENSE_CATS = [
   { value:"OTHER",              label:"📝 Otro gasto",         color:"#6b7280" },
 ];
 
-type Screen = "login"|"home"|"detail"|"chat"|"history"|"cobrar"|"caja"|"gasto"|"weekly";
+type Screen = "login"|"home"|"detail"|"chat"|"history"|"cobrar"|"caja"|"gasto"|"weekly"|"settings";
 
 async function subscribePush(driverId: string) {
-  if (!("serviceWorker" in navigator) || !("PushManager" in window)) return;
+  if (typeof window === "undefined" || !("serviceWorker" in navigator) || !("PushManager" in window)) return;
   try {
     const reg = await navigator.serviceWorker.ready;
     const existing = await reg.pushManager.getSubscription();
@@ -44,7 +45,8 @@ export default function DeliveryApp() {
   const [messages, setMessages] = useState<any[]>([]);
   const [newMsg, setNewMsg]     = useState("");
   const [sending, setSending]   = useState(false);
-  const [prevOrderCount, setPrevOrderCount] = useState(0);
+
+  const prevOrderCountRef = useRef(0);
 
   const [email, setEmail]       = useState("");
   const [password, setPassword] = useState("");
@@ -67,34 +69,79 @@ export default function DeliveryApp() {
 
   const fileRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const audioRef = useRef<HTMLAudioElement|null>(null);
   const [isOnline, setIsOnline] = useState(true);
+
+  // Estados de configuración
+  const [theme, setTheme] = useState<"dark"|"light">("dark");
+  const [notificationsEnabled, setNotificationsEnabled] = useState(true);
 
   useEffect(() => {
     setMounted(true);
-    setIsOnline(navigator.onLine);
-    window.addEventListener('online',  () => setIsOnline(true));
-    window.addEventListener('offline', () => setIsOnline(false));
-    audioRef.current = new Audio('/notification.mp3');
+    if (typeof window !== "undefined") {
+      setIsOnline(navigator.onLine);
+      window.addEventListener('online',  () => setIsOnline(true));
+      window.addEventListener('offline', () => setIsOnline(false));
+
+      // Cargar configuraciones guardadas
+      const savedTheme = localStorage.getItem("appTheme") as "dark"|"light" | null;
+      if (savedTheme) {
+        setTheme(savedTheme);
+        document.documentElement.setAttribute("data-theme", savedTheme);
+      }
+
+      const savedNotifs = localStorage.getItem("notificationsEnabled");
+      if (savedNotifs !== null) setNotificationsEnabled(savedNotifs === "true");
+
+      LocalNotifications.requestPermissions();
+    }
   }, []);
+
+  const toggleTheme = () => {
+    const newTheme = theme === "dark" ? "light" : "dark";
+    setTheme(newTheme);
+    localStorage.setItem("appTheme", newTheme);
+    document.documentElement.setAttribute("data-theme", newTheme);
+  };
+
+  const toggleNotifications = () => {
+    const newValue = !notificationsEnabled;
+    setNotificationsEnabled(newValue);
+    localStorage.setItem("notificationsEnabled", String(newValue));
+  };
+
+  const notifyNewOrder = async (count: number) => {
+    if (!notificationsEnabled) return;
+    try {
+      await LocalNotifications.schedule({
+        notifications: [
+          {
+            title: "🛵 Nuevo pedido asignado",
+            body: `Tienes ${count} pedido(s) nuevo(s)`,
+            id: Date.now(),
+            schedule: { at: new Date(Date.now() + 500) },
+            sound: undefined,
+            actionTypeId: "",
+            extra: null
+          }
+        ]
+      });
+    } catch (err) {
+      console.error("Error lanzando notificación local", err);
+    }
+  };
 
   const fetchOrders = useCallback(async (d?: any) => {
     const id = (d || driver)?.id; if (!id) return;
     try {
       const { data } = await api.get(`/api/delivery/${id}/orders`);
-      if (data.length > prevOrderCount && prevOrderCount > 0) {
-        audioRef.current?.play().catch(() => {});
-        if (Notification.permission === "granted") {
-          new Notification("🛵 Nuevo pedido asignado", {
-            body: `Tienes ${data.length - prevOrderCount} pedido(s) nuevo(s)`,
-            icon: "/logo.png",
-          });
-        }
+      const currentCount = data.length;
+      if (currentCount > prevOrderCountRef.current && prevOrderCountRef.current > 0) {
+        notifyNewOrder(currentCount - prevOrderCountRef.current);
       }
-      setPrevOrderCount(data.length);
+      prevOrderCountRef.current = currentCount;
       setOrders(data);
     } catch {}
-  }, [driver, prevOrderCount]);
+  }, [driver, notificationsEnabled]);
 
   const fetchHistory = useCallback(async () => {
     if (!driver) return;
@@ -129,12 +176,11 @@ export default function DeliveryApp() {
   useEffect(() => {
     if (driver) {
       fetchOrders(); fetchHistory();
-      if (Notification.permission === "default") Notification.requestPermission();
       subscribePush(driver.id);
       const t = setInterval(() => fetchOrders(), 15000);
       return () => clearInterval(t);
     }
-  }, [driver]);
+  }, [driver, fetchOrders, fetchHistory]);
 
   useEffect(() => {
     if (screen === "chat" && selectedOrder) {
@@ -142,10 +188,10 @@ export default function DeliveryApp() {
       const t = setInterval(() => fetchMessages(selectedOrder.id), 5000);
       return () => clearInterval(t);
     }
-  }, [screen, selectedOrder]);
+  }, [screen, selectedOrder, fetchMessages]);
 
-  useEffect(() => { if (screen === "caja") fetchCash(); }, [screen]);
-  useEffect(() => { if (screen === "weekly") fetchHistory(); }, [screen]);
+  useEffect(() => { if (screen === "caja") fetchCash(); }, [screen, fetchCash]);
+  useEffect(() => { if (screen === "weekly") fetchHistory(); }, [screen, fetchHistory]);
 
   async function handleLogin(e: React.FormEvent) {
     e.preventDefault(); setLoggingIn(true);
@@ -163,22 +209,19 @@ export default function DeliveryApp() {
       const isCash = method === "CASH" || payMethod === "CASH";
 
       if (status === "DELIVERED" && isCash) {
-        // Confirmar entrega sin cerrar cobro — efectivo pendiente al cierre de turno
         const { data } = await api.put(`/api/delivery/${driver.id}/orders/${order.id}/deliver`);
         setSelectedOrder(data);
-        // Registrar en caja del repartidor como pendiente
         await api.post(`/api/driver-cash/${driver.id}/collect`, {
           orderId: order.id,
           amount: Number(order.total),
           orderNumber: order.orderNumber,
           pending: true,
-        }).catch(() => {}); // no bloquear si falla
+        }).catch(() => {});
         fetchOrders();
         setScreen("home");
         return;
       }
 
-      // Flujo normal (transferencia u otros estados)
       const { data } = await api.put(`/api/delivery/${driver.id}/orders/${order.id}/status`, {
         status, ...(method ? { paymentMethod: method } : {})
       });
@@ -239,7 +282,7 @@ export default function DeliveryApp() {
   // ══════════════════════════════════
   if (screen === "login") return (
     <div className="min-h-screen flex items-center justify-center p-6" style={{background:"var(--bg)"}}>
-      <div className="w-full max-w-sm">
+      <div className="w-full max-sm:px-0 max-w-sm">
         <div className="text-center mb-8">
           <div className="text-6xl mb-3">🛵</div>
           <h1 className="font-syne text-3xl font-black">App Repartidor</h1>
@@ -286,6 +329,9 @@ export default function DeliveryApp() {
           </div>
         </div>
         <div className="flex gap-1.5">
+          <button onClick={() => setScreen("settings")}
+            className="px-2.5 py-1.5 rounded-xl text-xs font-bold border"
+            style={{borderColor:"var(--border)",color:"var(--muted)"}}>⚙️</button>
           <button onClick={() => { fetchHistory(); setScreen("weekly"); }}
             className="px-2.5 py-1.5 rounded-xl text-xs font-bold border"
             style={{borderColor:"var(--border)",color:"var(--muted)"}}>📊</button>
@@ -415,6 +461,54 @@ export default function DeliveryApp() {
             </div>
           );
         })}
+      </div>
+    </div>
+  );
+
+  // ══════════════════════════════════
+  // SETTINGS
+  // ══════════════════════════════════
+  if (screen === "settings") return (
+    <div className="min-h-screen flex flex-col" style={{background:"var(--bg)"}}>
+      <div className="px-4 py-3 flex items-center gap-3 border-b" style={{background:"var(--surf)",borderColor:"var(--border)"}}>
+        <button onClick={() => setScreen("home")} className="w-10 h-10 rounded-xl flex items-center justify-center"
+          style={{background:"var(--surf2)",color:"var(--muted)"}}>←</button>
+        <h1 className="font-syne font-black text-xl">Configuración</h1>
+      </div>
+      <div className="p-4 flex flex-col gap-4">
+        <div className="rounded-2xl border p-4" style={{background:"var(--surf)",borderColor:"var(--border)"}}>
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="font-bold">Tema de la App</div>
+              <div className="text-xs" style={{color:"var(--muted)"}}>Cambia entre modo claro y oscuro</div>
+            </div>
+            <button onClick={toggleTheme} className="px-4 py-2 rounded-xl text-xs font-black"
+              style={{background:"var(--surf2)", border:"1px solid var(--border)", color:"var(--text)"}}>
+              {theme === "dark" ? "🌙 Oscuro" : "☀️ Claro"}
+            </button>
+          </div>
+        </div>
+
+        <div className="rounded-2xl border p-4" style={{background:"var(--surf)",borderColor:"var(--border)"}}>
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="font-bold">Notificaciones</div>
+              <div className="text-xs" style={{color:"var(--muted)"}}>Sonido al recibir pedidos nuevos</div>
+            </div>
+            <button onClick={toggleNotifications} className="px-4 py-2 rounded-xl text-xs font-black"
+              style={{
+                background: notificationsEnabled ? "rgba(34,197,94,0.1)" : "rgba(239,68,68,0.1)",
+                color: notificationsEnabled ? "#22c55e" : "#ef4444",
+                border: `1px solid ${notificationsEnabled ? "rgba(34,197,94,0.2)" : "rgba(239,68,68,0.2)"}`
+              }}>
+              {notificationsEnabled ? "ON" : "OFF"}
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-4 text-center">
+          <p className="text-[10px] uppercase tracking-widest font-bold opacity-30">Master Burger Delivery v1.0.0</p>
+        </div>
       </div>
     </div>
   );

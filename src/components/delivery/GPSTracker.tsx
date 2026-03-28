@@ -1,10 +1,10 @@
-// GPSTracker.tsx — Componente de tracking para app repartidor
+// GPSTracker.tsx — Componente de tracking nativo con Capacitor
 "use client";
 import { useEffect, useRef, useState, useCallback } from "react";
 import api from "@/lib/api";
+import { Geolocation } from '@capacitor/geolocation';
 
-const ORIGIN_THRESHOLD = 50; // metros para activar tracking automático
-const TRACK_INTERVAL   = 60000; // 1 minuto
+const TRACK_INTERVAL = 60000; // 1 minuto
 
 interface Props {
   driverId: string;
@@ -15,97 +15,118 @@ interface Props {
 
 export default function GPSTracker({ driverId, activeOrderId, onRouteStart, onRouteEnd }: Props) {
   const [tracking, setTracking]       = useState(false);
-  const [routeId, setRouteId]         = useState<string|null>(null);
   const [distFromOrigin, setDistFromOrigin] = useState<number|null>(null);
   const [accuracy, setAccuracy]       = useState<number|null>(null);
   const [permDenied, setPermDenied]   = useState(false);
   const [pointsSent, setPointsSent]   = useState(0);
-  const watchRef  = useRef<number|null>(null);
-  const timerRef  = useRef<any>(null);
-  const lastPosRef = useRef<{lat:number,lng:number}|null>(null);
+
+  const watchIdRef = useRef<string|null>(null);
+  const timerRef   = useRef<any>(null);
 
   const startRoute = useCallback(async (lat: number, lng: number, trigger = "MANUAL") => {
     try {
-      const { data } = await api.post(`/api/gps/${driverId}/route/start`, {
+      await api.post(`/api/gps/${driverId}/route/start`, {
         lat, lng, orderId: activeOrderId || null, trigger
       });
-      setRouteId(data.id);
       setTracking(true);
       onRouteStart?.();
-    } catch {}
+    } catch (err) {
+      console.error("Error al iniciar ruta", err);
+    }
   }, [driverId, activeOrderId, onRouteStart]);
 
-  const sendLocation = useCallback(async (pos: GeolocationPosition) => {
-    const { latitude: lat, longitude: lng, accuracy, speed, heading } = pos.coords;
-    lastPosRef.current = { lat, lng };
-    setAccuracy(Math.round(accuracy));
+  const sendLocation = useCallback(async (lat: number, lng: number, acc: number, speed: number|null, heading: number|null) => {
+    setAccuracy(Math.round(acc));
     try {
       const { data } = await api.post(`/api/gps/${driverId}/location`, {
-        lat, lng, accuracy, speed, heading, orderId: activeOrderId || null
+        lat, lng, accuracy: acc, speed, heading, orderId: activeOrderId || null
       });
       setDistFromOrigin(data.distFromOrigin);
       setPointsSent(p => p + 1);
-    } catch {}
+    } catch (err) {
+      console.error("Error enviando ubicación", err);
+    }
   }, [driverId, activeOrderId]);
 
-  // Iniciar tracking manual
-  async function handleStartTracking() {
-    if (!navigator.geolocation) { alert("Tu dispositivo no soporta GPS"); return; }
-    navigator.geolocation.getCurrentPosition(
-      async (pos) => {
-        await startRoute(pos.coords.latitude, pos.coords.longitude, "MANUAL");
-        startWatching();
-      },
-      () => setPermDenied(true),
-      { enableHighAccuracy: true }
-    );
-  }
+  const startWatching = useCallback(async () => {
+    // 1. Pedir permisos nativos
+    const permission = await Geolocation.requestPermissions();
+    if (permission.location !== 'granted') {
+      setPermDenied(true);
+      return;
+    }
 
-  function startWatching() {
-    // Watch position cada minuto
-    timerRef.current = setInterval(() => {
-      navigator.geolocation.getCurrentPosition(sendLocation, () => {}, { enableHighAccuracy: true });
-    }, TRACK_INTERVAL);
-    // También watch continuo para detectar salida de origen
-    watchRef.current = navigator.geolocation.watchPosition(
-      (pos) => { sendLocation(pos); },
-      () => {},
-      { enableHighAccuracy: true, maximumAge: 30000 }
+    // 2. Iniciar watch continuo (más preciso para el sistema)
+    watchIdRef.current = await Geolocation.watchPosition(
+      { enableHighAccuracy: true, timeout: 10000 },
+      (pos) => {
+        if (pos) {
+          sendLocation(
+            pos.coords.latitude,
+            pos.coords.longitude,
+            pos.coords.accuracy,
+            pos.coords.speed,
+            pos.coords.heading
+          );
+        }
+      }
     );
+
+    // 3. También un timer de respaldo cada minuto
+    timerRef.current = setInterval(async () => {
+      const pos = await Geolocation.getCurrentPosition({ enableHighAccuracy: true });
+      sendLocation(
+        pos.coords.latitude,
+        pos.coords.longitude,
+        pos.coords.accuracy,
+        pos.coords.speed,
+        pos.coords.heading
+      );
+    }, TRACK_INTERVAL);
+
+  }, [sendLocation]);
+
+  async function handleStartTracking() {
+    try {
+      const pos = await Geolocation.getCurrentPosition({ enableHighAccuracy: true });
+      await startRoute(pos.coords.latitude, pos.coords.longitude, "MANUAL");
+      await startWatching();
+    } catch (e) {
+      setPermDenied(true);
+    }
   }
 
   async function handleStopTracking() {
     if (timerRef.current) clearInterval(timerRef.current);
-    if (watchRef.current !== null) navigator.geolocation.clearWatch(watchRef.current);
+    if (watchIdRef.current) Geolocation.clearWatch({ id: watchIdRef.current });
+
     try { await api.post(`/api/gps/${driverId}/route/end`); } catch {}
-    setTracking(false); setRouteId(null); setPointsSent(0);
+    setTracking(false); setPointsSent(0);
     onRouteEnd?.();
   }
 
   // Auto-iniciar cuando se asigna un pedido
   useEffect(() => {
     if (activeOrderId && !tracking) {
-      navigator.geolocation?.getCurrentPosition(
-        async (pos) => {
-          await startRoute(pos.coords.latitude, pos.coords.longitude, "ORDER_ASSIGNED");
-          startWatching();
-        },
-        () => {},
-        { enableHighAccuracy: true }
-      );
+      Geolocation.getCurrentPosition({ enableHighAccuracy: true }).then(async (pos) => {
+        await startRoute(pos.coords.latitude, pos.coords.longitude, "ORDER_ASSIGNED");
+        await startWatching();
+      }).catch(() => {});
     }
-  }, [activeOrderId]);
+  }, [activeOrderId, tracking, startRoute, startWatching]);
 
   // Cleanup
-  useEffect(() => () => {
-    if (timerRef.current) clearInterval(timerRef.current);
-    if (watchRef.current !== null) navigator.geolocation?.clearWatch(watchRef.current);
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+      if (watchIdRef.current) Geolocation.clearWatch({ id: watchIdRef.current });
+    };
   }, []);
 
   if (permDenied) return (
     <div className="mx-5 mb-3 px-4 py-3 rounded-xl text-xs"
       style={{background:"rgba(239,68,68,0.1)",color:"#ef4444",border:"1px solid rgba(239,68,68,0.2)"}}>
-      ⚠️ Sin permiso de ubicación — actívalo en la configuración del navegador
+      ⚠️ Permiso de ubicación denegado. Por favor, actívalo en los ajustes de la aplicación en Android.
     </div>
   );
 
@@ -116,9 +137,9 @@ export default function GPSTracker({ driverId, activeOrderId, onRouteStart, onRo
           style={{background:"rgba(34,197,94,0.1)",border:"1px solid rgba(34,197,94,0.2)"}}>
           <div className="w-2 h-2 rounded-full animate-pulse flex-shrink-0" style={{background:"#22c55e"}} />
           <div className="flex-1">
-            <div className="text-xs font-bold" style={{color:"#22c55e"}}>GPS activo · {pointsSent} puntos enviados</div>
+            <div className="text-xs font-bold" style={{color:"#22c55e"}}>GPS Activo (Nativo) · {pointsSent} pts</div>
             {distFromOrigin !== null && (
-              <div className="text-xs" style={{color:"#22c55e"}}>{distFromOrigin}m del restaurante · ±{accuracy}m</div>
+              <div className="text-xs" style={{color:"#22c55e"}}>{distFromOrigin}m del local · ±{accuracy}m</div>
             )}
           </div>
           <button onClick={handleStopTracking}
@@ -131,7 +152,7 @@ export default function GPSTracker({ driverId, activeOrderId, onRouteStart, onRo
         <button onClick={handleStartTracking}
           className="w-full px-4 py-3 rounded-xl text-xs font-bold flex items-center justify-center gap-2"
           style={{background:"rgba(59,130,246,0.1)",color:"#3b82f6",border:"1px solid rgba(59,130,246,0.2)"}}>
-          📍 Iniciar seguimiento GPS
+          📍 Activar Rastreo GPS Nativo
         </button>
       )}
     </div>
